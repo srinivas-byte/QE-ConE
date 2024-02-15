@@ -289,78 +289,59 @@ class KGReasoning(nn.Module):
         return axis_embedding, arg_embedding, idx
 
     # implement distance function
+    # def cal_logit_cone(self, entity_embedding, query_axis_embedding, query_arg_embedding):
     def cal_logit_cone(self, entity_embedding, query_axis_embedding, query_arg_embedding):
-        delta1 = entity_embedding - (query_axis_embedding - query_arg_embedding)
-        delta2 = entity_embedding - (query_axis_embedding + query_arg_embedding)
+      delta = entity_embedding - query_axis_embedding
+      distance_out = torch.relu(torch.abs(delta) - query_arg_embedding)
+      distance_in = torch.min(torch.abs(delta), query_arg_embedding)
+      logit = self.gamma - torch.norm(distance_out, p=1, dim=-1) - self.cen * torch.norm(distance_in, p=1, dim=-1)
+      return logit
 
-        distance2axis = torch.abs(torch.sin((entity_embedding - query_axis_embedding) / 2))
-        distance_base = torch.abs(torch.sin(query_arg_embedding / 2))
-
-        indicator_in = distance2axis < distance_base
-        distance_out = torch.min(torch.abs(torch.sin(delta1 / 2)), torch.abs(torch.sin(delta2 / 2)))
-        distance_out[indicator_in] = 0.
-
-        distance_in = torch.min(distance2axis, distance_base)
-
-        distance = torch.norm(distance_out, p=1, dim=-1) + self.cen * torch.norm(distance_in, p=1, dim=-1)
-        logit = self.gamma - distance * self.modulus
-
-        return logit
-
-    # implement formatting forward method
     def forward(self, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict):
-        all_idxs, all_axis_embeddings, all_arg_embeddings = [], [], []
-        all_union_idxs, all_union_axis_embeddings, all_union_arg_embeddings = [], [], []
+        all_center_embeddings, all_offset_embeddings, all_idxs = [], [], []
+        all_union_center_embeddings, all_union_offset_embeddings, all_union_idxs = [], [], []
         for query_structure in batch_queries_dict:
-            if 'u' in self.query_name_dict[query_structure] and 'DNF' in self.query_name_dict[query_structure]:
-                axis_embedding, arg_embedding, _ = \
-                    self.embed_query_cone(self.transform_union_query(batch_queries_dict[query_structure], query_structure), self.transform_union_structure(query_structure), 0)
+            if 'u' in self.query_name_dict[query_structure]:
+                center_embedding, offset_embedding, _ = \
+                    self.embed_query_cone(self.transform_union_query(batch_queries_dict[query_structure], 
+                                                                    query_structure), 
+                                        self.transform_union_structure(query_structure), 
+                                        0)
+                all_union_center_embeddings.append(center_embedding)
+                all_union_offset_embeddings.append(offset_embedding)
                 all_union_idxs.extend(batch_idxs_dict[query_structure])
-                all_union_axis_embeddings.append(axis_embedding)
-                all_union_arg_embeddings.append(arg_embedding)
             else:
-                axis_embedding, arg_embedding, _ = self.embed_query_cone(batch_queries_dict[query_structure], query_structure, 0)
+                center_embedding, offset_embedding, _ = self.embed_query_cone(batch_queries_dict[query_structure], 
+                                                                            query_structure, 
+                                                                            0)
+                all_center_embeddings.append(center_embedding)
+                all_offset_embeddings.append(offset_embedding)
                 all_idxs.extend(batch_idxs_dict[query_structure])
-                all_axis_embeddings.append(axis_embedding)
-                all_arg_embeddings.append(arg_embedding)
 
-        if len(all_axis_embeddings) > 0:
-            all_axis_embeddings = torch.cat(all_axis_embeddings, dim=0).unsqueeze(1)
-            all_arg_embeddings = torch.cat(all_arg_embeddings, dim=0).unsqueeze(1)
-        if len(all_union_axis_embeddings) > 0:
-            all_union_axis_embeddings = torch.cat(all_union_axis_embeddings, dim=0).unsqueeze(1)
-            all_union_arg_embeddings = torch.cat(all_union_arg_embeddings, dim=0).unsqueeze(1)
-            all_union_axis_embeddings = all_union_axis_embeddings.view(
-                all_union_axis_embeddings.shape[0] // 2, 2, 1, -1)
-            all_union_arg_embeddings = all_union_arg_embeddings.view(
-                all_union_arg_embeddings.shape[0] // 2, 2, 1, -1)
+        if len(all_center_embeddings) > 0 and len(all_offset_embeddings) > 0:
+            all_center_embeddings = torch.cat(all_center_embeddings, dim=0).unsqueeze(1)
+            all_offset_embeddings = torch.cat(all_offset_embeddings, dim=0).unsqueeze(1)
+        if len(all_union_center_embeddings) > 0 and len(all_union_offset_embeddings) > 0:
+            all_union_center_embeddings = torch.cat(all_union_center_embeddings, dim=0).unsqueeze(1)
+            all_union_offset_embeddings = torch.cat(all_union_offset_embeddings, dim=0).unsqueeze(1)
+            all_union_center_embeddings = all_union_center_embeddings.view(all_union_center_embeddings.shape[0]//2, 2, 1, -1)
+            all_union_offset_embeddings = all_union_offset_embeddings.view(all_union_offset_embeddings.shape[0]//2, 2, 1, -1)
+
         if type(subsampling_weight) != type(None):
-            subsampling_weight = subsampling_weight[all_idxs + all_union_idxs]
+            subsampling_weight = subsampling_weight[all_idxs+all_union_idxs]
 
         if type(positive_sample) != type(None):
-            if len(all_axis_embeddings) > 0:
-                # positive samples for non-union queries in this batch
+            if len(all_center_embeddings) > 0:
                 positive_sample_regular = positive_sample[all_idxs]
                 positive_embedding = torch.index_select(self.entity_embedding, dim=0, index=positive_sample_regular).unsqueeze(1)
-
-                positive_embedding = self.angle_scale(positive_embedding, self.axis_scale)
-                positive_embedding = convert_to_axis(positive_embedding)
-
-                positive_logit = self.cal_logit_cone(positive_embedding, all_axis_embeddings, all_arg_embeddings)
+                positive_logit = self.cal_logit_cone(positive_embedding, all_center_embeddings, all_offset_embeddings)
             else:
                 positive_logit = torch.Tensor([]).to(self.entity_embedding.device)
 
-
-            if len(all_union_axis_embeddings) > 0:
-                # positive samples for union queries in this batch
+            if len(all_union_center_embeddings) > 0:
                 positive_sample_union = positive_sample[all_union_idxs]
                 positive_embedding = torch.index_select(self.entity_embedding, dim=0, index=positive_sample_union).unsqueeze(1).unsqueeze(1)
-
-                positive_embedding = self.angle_scale(positive_embedding, self.axis_scale)
-                positive_embedding = convert_to_axis(positive_embedding)
-
-                positive_union_logit = self.cal_logit_cone(positive_embedding, all_union_axis_embeddings, all_union_arg_embeddings)
-
+                positive_union_logit = self.cal_logit_cone(positive_embedding, all_union_center_embeddings, all_union_offset_embeddings)
                 positive_union_logit = torch.max(positive_union_logit, dim=1)[0]
             else:
                 positive_union_logit = torch.Tensor([]).to(self.entity_embedding.device)
@@ -369,25 +350,19 @@ class KGReasoning(nn.Module):
             positive_logit = None
 
         if type(negative_sample) != type(None):
-            if len(all_axis_embeddings) > 0:
+            if len(all_center_embeddings) > 0:
                 negative_sample_regular = negative_sample[all_idxs]
                 batch_size, negative_size = negative_sample_regular.shape
                 negative_embedding = torch.index_select(self.entity_embedding, dim=0, index=negative_sample_regular.view(-1)).view(batch_size, negative_size, -1)
-                negative_embedding = self.angle_scale(negative_embedding, self.axis_scale)
-                negative_embedding = convert_to_axis(negative_embedding)
-
-                negative_logit = self.cal_logit_cone(negative_embedding, all_axis_embeddings, all_arg_embeddings)
+                negative_logit = self.cal_logit_cone(negative_embedding, all_center_embeddings, all_offset_embeddings)
             else:
                 negative_logit = torch.Tensor([]).to(self.entity_embedding.device)
 
-            if len(all_union_axis_embeddings) > 0:
+            if len(all_union_center_embeddings) > 0:
                 negative_sample_union = negative_sample[all_union_idxs]
                 batch_size, negative_size = negative_sample_union.shape
                 negative_embedding = torch.index_select(self.entity_embedding, dim=0, index=negative_sample_union.view(-1)).view(batch_size, 1, negative_size, -1)
-                negative_embedding = self.angle_scale(negative_embedding, self.axis_scale)
-                negative_embedding = convert_to_axis(negative_embedding)
-
-                negative_union_logit = self.cal_logit_cone(negative_embedding, all_union_axis_embeddings, all_union_arg_embeddings)
+                negative_union_logit = self.cal_logit_cone(negative_embedding, all_union_center_embeddings, all_union_offset_embeddings)
                 negative_union_logit = torch.max(negative_union_logit, dim=1)[0]
             else:
                 negative_union_logit = torch.Tensor([]).to(self.entity_embedding.device)
@@ -395,9 +370,7 @@ class KGReasoning(nn.Module):
         else:
             negative_logit = None
 
-        return positive_logit, negative_logit, subsampling_weight, all_idxs + all_union_idxs
-
-
+        return positive_logit, negative_logit, subsampling_weight, all_idxs+all_union_idxs
 
 class ConeProjection(nn.Module):
     def __init__(self, dim, hidden_dim, num_layers):
